@@ -6,6 +6,7 @@ one-time path, and shuts down after one successful save or when the timeout expi
 never reach stdout, logs or command-line arguments; output carries variable names only.
 
 Sinks (pick one):
+  --env-auto [--dir D]  per variable, the project's git-ignored .env* file (see AutoEnvSink)
   --env PATH            write NAME=value into a .env file (mode 600, atomic replace)
   --keychain SERVICE    macOS Keychain generic password, service SERVICE, account NAME
   --sink-cmd "CMD"      run CMD once per variable with the value on stdin; {name} is replaced
@@ -25,10 +26,14 @@ Startup problems print a message to stderr and exit 1 before the page opens, so 
 user typed is never lost to a misconfigured sink.
 
 Using a saved secret (one command only, nothing printed):
-  python3 -I keydrop.py exec (--env PATH | --keychain SERVICE) NAME [NAME ...] -- CMD [ARG ...]
+  python3 -I keydrop.py exec (--env-auto [--dir D] [--mode M] | --env PATH ... | --keychain SERVICE)
+                             NAME [NAME ...] -- CMD [ARG ...]
 The named values are added to CMD's environment and keydrop is replaced by CMD, so the exit
 code is CMD's own. keydrop's own failures exit 125 (missing name, unreadable source),
 126 (CMD not executable) or 127 (CMD not found) without running anything.
+
+SessionStart hook (Claude Code): `keydrop.py context [DIR]` prints the names of the secrets in
+DIR's git-ignored .env* files as hook context, or nothing when there are none.
 """
 
 from __future__ import annotations
@@ -50,7 +55,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_\-.]{16,400}")
 # No control characters: a newline would break .env files and shell injection of the value.
@@ -159,54 +164,148 @@ def env_literal(value: str) -> str | None:
     return None
 
 
+# Committed templates of a .env file. keydrop never writes secrets into these.
+TEMPLATE_SUFFIXES = {"example", "sample", "template", "tmpl", "dist"}
+
+
+def is_env_file_name(name: str) -> bool:
+    if name == ".env":
+        return True
+    return name.startswith(".env.") and name.rsplit(".", 1)[-1] not in TEMPLATE_SUFFIXES
+
+
+def git_state(path: Path) -> str:
+    """tracked, ignored, untracked (in a repository, not ignored) or norepo."""
+    git = shutil.which("git")
+    if not git:
+        return "norepo"
+    try:
+        tracked = run([git, "-C", str(path.parent), "ls-files", "--error-unmatch", "--", path.name], 10)
+        if tracked.returncode == 0:
+            return "tracked"
+        ignored = run([git, "-C", str(path.parent), "check-ignore", "-q", "--", path.name], 10)
+    except (OSError, subprocess.TimeoutExpired):
+        return "norepo"
+    return {0: "ignored", 1: "untracked"}.get(ignored.returncode, "norepo")
+
+
+def write_env_file(path: Path, values: dict[str, str]) -> bool:
+    lines = path.read_text().splitlines() if path.exists() else []
+    out, done = [], set()
+    for line in lines:
+        m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=", line)
+        if m and m.group(1) in values:
+            name = m.group(1)
+            if name not in done:
+                out.append(f"{name}={env_literal(values[name])}")
+                done.add(name)
+            continue
+        out.append(line)
+    out += [f"{k}={env_literal(v)}" for k, v in values.items() if k not in done]
+    tmp = path.with_name(f".{path.name}.keydrop-{secrets.token_hex(4)}")
+    try:
+        # Create with mode 600 from the start so the value is never readable by others, then swap in.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(out) + "\n")
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def check_writable(path: Path) -> None:
+    if not path.parent.is_dir():
+        sys.exit(f"Directory does not exist: {path.parent}")
+    if not os.access(path.parent, os.W_OK) or (path.exists() and not os.access(path, os.W_OK)):
+        sys.exit(f"Cannot write {path}")
+
+
 class EnvSink:
     def __init__(self, path: str):
         self.path = Path(path).expanduser().resolve()
         self.label = self.path.name
-        if not self.path.parent.is_dir():
-            sys.exit(f"Directory does not exist: {self.path.parent}")
-        if not os.access(self.path.parent, os.W_OK) or (self.path.exists() and not os.access(self.path, os.W_OK)):
-            sys.exit(f"Cannot write {self.path}")
+        check_writable(self.path)
+        if self.path.name.startswith(".env.") and not is_env_file_name(self.path.name):
+            sys.exit(f"{self.path.name} is a template that gets committed; write the secret to .env or .env.local")
+        self.state = git_state(self.path)
+        if self.state == "tracked":
+            sys.exit(f"{self.path} is tracked by git, so the secret would be committed. "
+                     "Use an ignored file such as .env.local, or untrack this one first.")
 
     def warnings(self) -> list[str]:
-        git = shutil.which("git")
-        if not git:
-            return []
-        try:
-            out = run([git, "-C", str(self.path.parent), "check-ignore", "-q", str(self.path)], 10)
-        except (OSError, subprocess.TimeoutExpired):
-            return []
-        # 0: ignored, 1: inside a repository and not ignored, 128: not a repository.
-        return [f"{self.path} is not git-ignored; add it to .gitignore"] if out.returncode == 1 else []
+        return [f"{self.path} is not git-ignored; add it to .gitignore"] if self.state == "untracked" else []
 
     def rejects(self, value: str) -> bool:
         return env_literal(value) is None
 
     def store(self, values: dict[str, str]) -> list[str]:
-        lines = self.path.read_text().splitlines() if self.path.exists() else []
-        out, done = [], set()
-        for line in lines:
-            m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=", line)
-            if m and m.group(1) in values:
-                name = m.group(1)
-                if name not in done:
-                    out.append(f"{name}={env_literal(values[name])}")
-                    done.add(name)
-                continue
-            out.append(line)
-        out += [f"{k}={env_literal(v)}" for k, v in values.items() if k not in done]
-        tmp = self.path.with_name(f".{self.path.name}.keydrop-{secrets.token_hex(4)}")
-        try:
-            # Create with mode 600 from the start so the value is never readable by others, then swap in.
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as f:
-                f.write("\n".join(out) + "\n")
-            os.replace(tmp, self.path)
-            os.chmod(self.path, 0o600)
-        except OSError:
-            tmp.unlink(missing_ok=True)
-            return list(values)
+        return [] if write_env_file(self.path, values) else list(values)
+
+
+class AutoEnvSink:
+    """Pick the project's .env file for each variable the way frameworks resolve them.
+
+    A name already defined in an ignored .env* file is updated there (every such file, so no
+    stale copy shadows the new value). A new name goes to .env.local or .env, whichever exists
+    and is ignored, else to a new ignored .env, else to a new ignored .env.local. Tracked files
+    are never written; a file that is neither tracked nor ignored stops keydrop before the page opens.
+    """
+
+    def __init__(self, directory: str, names: list[str]):
+        root = Path(directory).expanduser().resolve()
+        if not root.is_dir():
+            sys.exit(f"Directory does not exist: {root}")
+        files = sorted(p for p in root.iterdir() if is_env_file_name(p.name) and p.is_file())
+        states = {p: git_state(p) for p in files}
+        self.targets: dict[str, list[Path]] = {}
+        for name in names:
+            defining = [p for p in files if states[p] != "tracked" and name in read_env_file(p)]
+            loose = [p.name for p in defining if states[p] == "untracked"]
+            if loose:
+                sys.exit(f"{name} is defined in {', '.join(loose)}, which git does not ignore. "
+                         "Add it to .gitignore first.")
+            if not defining:
+                defining = [self.default_file(root, states)]
+            for p in defining:
+                check_writable(p)
+            self.targets[name] = defining
+        self.label = ", ".join(sorted({p.name for ps in self.targets.values() for p in ps}))
+
+    @staticmethod
+    def default_file(root: Path, states: dict[Path, str]) -> Path:
+        ok = ("ignored", "norepo")
+        for name in (".env.local", ".env"):
+            p = root / name
+            if p in states and states[p] in ok:
+                return p
+        for name in (".env", ".env.local"):
+            p = root / name
+            if p not in states and git_state(p) in ok:
+                return p
+        sys.exit(f"No git-ignored .env file to write in {root}. Add .env.local (or .env) to .gitignore.")
+
+    def files(self) -> dict[str, list[str]]:
+        return {n: [p.name for p in ps] for n, ps in self.targets.items()}
+
+    def warnings(self) -> list[str]:
         return []
+
+    def rejects(self, value: str) -> bool:
+        return env_literal(value) is None
+
+    def store(self, values: dict[str, str]) -> list[str]:
+        by_file: dict[Path, dict[str, str]] = {}
+        for name, value in values.items():
+            for p in self.targets[name]:
+                by_file.setdefault(p, {})[name] = value
+        failed = set()
+        for p, chunk in by_file.items():
+            if not write_env_file(p, chunk):
+                failed.update(chunk)
+        return [n for n in values if n in failed]
 
 
 def keychain_cli(service: str) -> str:
@@ -317,6 +416,12 @@ def read_keychain(cli: str, service: str, name: str) -> str | None:
     return None
 
 
+def env_auto_files(directory: str, mode: str | None) -> list[Path]:
+    root = Path(directory).expanduser()
+    order = [".env", f".env.{mode}", ".env.local", f".env.{mode}.local"] if mode else [".env", ".env.local"]
+    return [root / n for n in order if (root / n).is_file()]
+
+
 class ExecParser(argparse.ArgumentParser):
     def error(self, message):
         self.print_usage(sys.stderr)
@@ -334,8 +439,13 @@ def exec_main(argv: list[str]) -> None:
     ap = ExecParser(prog="keydrop.py exec",
                     description="Run one command with saved secrets added to its environment.")
     source = ap.add_mutually_exclusive_group(required=True)
-    source.add_argument("--env", metavar="PATH", help=".env file to read")
+    source.add_argument("--env", metavar="PATH", action="append",
+                        help=".env file to read; repeat for several, later files win")
+    source.add_argument("--env-auto", action="store_true",
+                        help="read .env, .env.MODE, .env.local, .env.MODE.local in --dir, later files winning")
     source.add_argument("--keychain", metavar="SERVICE", help="macOS Keychain service name")
+    ap.add_argument("--dir", default=".", help="project directory for --env-auto (default: current directory)")
+    ap.add_argument("--mode", help="with --env-auto: also read .env.MODE and .env.MODE.local")
     ap.add_argument("names", nargs="+", metavar="NAME")
     args = ap.parse_args(argv[:split])
     if split == len(argv):
@@ -347,14 +457,23 @@ def exec_main(argv: list[str]) -> None:
             exec_fail(f"invalid variable name: {name!r}")
 
     try:
-        if args.env:
-            path = Path(args.env).expanduser()
-            try:
-                found = read_env_file(path)
-            except OSError as exc:
-                exec_fail(f"cannot read {path}: {exc.strerror}")
+        if args.mode and not args.env_auto:
+            exec_fail("--mode needs --env-auto")
+        if args.mode and not re.fullmatch(r"[A-Za-z0-9_-]+", args.mode):
+            exec_fail(f"invalid mode: {args.mode!r}")
+        if args.env or args.env_auto:
+            paths = [Path(p).expanduser() for p in args.env] if args.env else env_auto_files(args.dir, args.mode)
+            if not paths:
+                exec_fail(f"no .env files in {Path(args.dir).expanduser()}")
+            # Later files win, including an empty definition, as in Next.js and Vite.
+            found = {}
+            for path in paths:
+                try:
+                    found.update(read_env_file(path))
+                except OSError as exc:
+                    exec_fail(f"cannot read {path}: {exc.strerror}")
             values = {n: found[n] for n in args.names if found.get(n)}
-            label = str(path)
+            label = ", ".join(str(p) for p in paths)
         else:
             cli = keychain_cli(args.keychain)
             values = {}
@@ -378,7 +497,36 @@ def exec_main(argv: list[str]) -> None:
         exec_fail(f"command not executable: {command[0]}", 126)
 
 
-PAGE ="""<!doctype html><html lang="{lang}"><head><meta charset="utf-8">
+def context_main(argv: list[str]) -> None:
+    """SessionStart hook: tell the agent which secrets this project has, by name only.
+
+    Prints nothing when there are none, and never fails the session start.
+    """
+    try:
+        root = Path(argv[0] if argv else os.environ.get("CLAUDE_PROJECT_DIR") or ".").expanduser().resolve()
+        found = []
+        for p in sorted(root.iterdir()):
+            if is_env_file_name(p.name) and p.is_file() and git_state(p) != "tracked":
+                names = [n for n, v in read_env_file(p).items() if v]
+                if names:
+                    found.append(f"{p.name}: {', '.join(names)}")
+    except (OSError, UnicodeDecodeError):
+        return
+    if not found:
+        return
+    script = Path(__file__).resolve()
+    text = (
+        "keydrop: this project has secrets saved in git-ignored files (names only; never print, cat or grep "
+        "their values): " + "; ".join(found) + ". "
+        "Apps that load .env files read them directly (restart a running server). "
+        f'For your own commands, wrap them: python3 -I "{script}" exec --env-auto --dir "{root}" NAME [NAME ...] -- CMD '
+        "(add --mode development etc. for .env.MODE files). "
+        "To add or replace a secret, use the keydrop skill; never ask for it in the chat."
+    )
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}))
+
+
+PAGE = """<!doctype html><html lang="{lang}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} · {suffix}</title>
 <style>
@@ -396,12 +544,17 @@ p{{color:var(--muted);white-space:pre-line}}.err{{color:#dc2626}}</style></head>
 def main() -> None:
     if sys.argv[1:2] == ["exec"]:
         return exec_main(sys.argv[2:])
+    if sys.argv[1:2] == ["context"]:
+        return context_main(sys.argv[2:])
     ap = argparse.ArgumentParser(description="One-time page for handing a secret to an agent.",
                                  epilog="To run a command with saved secrets: keydrop.py exec --help")
     sink_group = ap.add_mutually_exclusive_group(required=True)
     sink_group.add_argument("--env", metavar="PATH", help=".env file to write")
+    sink_group.add_argument("--env-auto", action="store_true",
+                            help="pick the project's git-ignored .env* file per variable (directory: --dir)")
     sink_group.add_argument("--keychain", metavar="SERVICE", help="macOS Keychain service name")
     sink_group.add_argument("--sink-cmd", metavar="CMD", help="command that reads the value on stdin; {name} is replaced")
+    ap.add_argument("--dir", default=".", help="project directory for --env-auto (default: current directory)")
     ap.add_argument("--var", action="append", required=True, metavar="NAME[:prefix1|prefix2]")
     ap.add_argument("--format", choices=("token", "text"), default="token",
                     help="token: 16-400 chars of [A-Za-z0-9_-.]; text: 1-2048 chars without control characters")
@@ -421,6 +574,8 @@ def main() -> None:
     t = MESSAGES[lang]
     if args.env:
         sink = EnvSink(args.env)
+    elif args.env_auto:
+        sink = AutoEnvSink(args.dir, list(specs))
     elif args.keychain:
         sink = KeychainSink(args.keychain)
     else:
@@ -534,7 +689,8 @@ def main() -> None:
     timer.start()
     host = f"[{bind}]" if ":" in bind else bind
     emit(event="listening", url=f"http://{host}:{server.server_address[1]}{route}",
-         expires_in=args.timeout, destination=sink.label, vars=list(specs), warnings=sink.warnings())
+         expires_in=args.timeout, destination=sink.label, vars=list(specs), warnings=sink.warnings(),
+         **({"files": sink.files()} if isinstance(sink, AutoEnvSink) else {}))
     server.serve_forever()
     if state["code"] is None:
         emit(event="timeout")

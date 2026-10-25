@@ -1,7 +1,7 @@
 {
   "name": "keydrop",
   "displayName": "keydrop",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Receive API keys, tokens and passwords without exposing them in the conversation. Opens a one-time input page on your Tailscale address (or localhost); the value is written to a .env file, the macOS Keychain, or piped to any command on stdin. Only variable names ever reach the agent.",
   "author": {
     "name": "risingdream"

@@ -270,5 +270,161 @@ class ExecTest(unittest.TestCase):
                 self.assertNotIn(TOKEN, r.stdout + r.stderr)
 
 
+def run_keydrop(*args: str, cwd: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, "-I", str(SCRIPT), *args],
+                          capture_output=True, text=True, timeout=30, cwd=cwd)
+
+
+class Project:
+    """A throwaway directory, optionally a git repository with an ignore file and committed files."""
+
+    def __init__(self, git: bool = True, ignore: str = "", **files: str):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        if git:
+            self.git("init", "-q")
+            if ignore:
+                (self.root / ".gitignore").write_text(ignore)
+
+    def git(self, *args: str) -> None:
+        subprocess.run(["git", "-C", str(self.root), "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+                       check=True, capture_output=True)
+
+    def write(self, name: str, text: str, commit: bool = False) -> Path:
+        path = self.root / name
+        path.write_text(text)
+        if commit:
+            self.git("add", "-f", name)
+            self.git("commit", "-q", "-m", name)
+        return path
+
+    def read(self, name: str) -> str:
+        return (self.root / name).read_text()
+
+    def close(self) -> None:
+        self.tmp.cleanup()
+
+
+class AutoEnvSinkTest(unittest.TestCase):
+    def project(self, **kw) -> Project:
+        p = Project(**kw)
+        self.addCleanup(p.close)
+        return p
+
+    def save(self, p: Project, *names: str, **values: str) -> dict:
+        d = Drop("--env-auto", "--dir", str(p.root), *[f"--var={n}" for n in names])
+        self.assertEqual(d.post(**values)[0], 200)
+        code, events, _ = d.finish()
+        self.assertEqual(code, 0)
+        return d.listening
+
+    def test_new_name_goes_to_existing_ignored_env_local(self):
+        p = self.project(ignore=".env*\n!.env.example\n")
+        p.write(".env.example", "A_TOKEN=\n", commit=True)
+        p.write(".env.local", "OTHER=1\n")
+        listening = self.save(p, "A_TOKEN", A_TOKEN=TOKEN)
+        self.assertEqual(listening["files"], {"A_TOKEN": [".env.local"]})
+        self.assertEqual(p.read(".env.local"), f"OTHER=1\nA_TOKEN={TOKEN}\n")
+        self.assertEqual(p.read(".env.example"), "A_TOKEN=\n")
+
+    def test_tracked_env_is_left_alone_and_env_local_created(self):
+        p = self.project(ignore=".env.local\n")
+        p.write(".env", "A_TOKEN=\nPORT=3000\n", commit=True)
+        listening = self.save(p, "A_TOKEN", A_TOKEN=TOKEN)
+        self.assertEqual(listening["files"], {"A_TOKEN": [".env.local"]})
+        self.assertEqual(p.read(".env"), "A_TOKEN=\nPORT=3000\n")
+        self.assertEqual(p.read(".env.local"), f"A_TOKEN={TOKEN}\n")
+        r = run_exec("--env-auto", "--dir", str(p.root), "A_TOKEN", "PORT", "--", "sh", "-c", 'printf "%s %s" "$A_TOKEN" "$PORT"')
+        self.assertEqual((r.returncode, r.stdout), (0, f"{TOKEN} 3000"))
+
+    def test_updates_every_ignored_file_that_defines_the_name(self):
+        p = self.project(ignore=".env*\n")
+        p.write(".env", "A_TOKEN=old\n")
+        p.write(".env.development.local", "A_TOKEN=older\n")
+        listening = self.save(p, "A_TOKEN", A_TOKEN=TOKEN)
+        self.assertEqual(listening["files"], {"A_TOKEN": [".env", ".env.development.local"]})
+        self.assertEqual(p.read(".env"), f"A_TOKEN={TOKEN}\n")
+        self.assertEqual(p.read(".env.development.local"), f"A_TOKEN={TOKEN}\n")
+
+    def test_new_ignored_env_when_nothing_exists(self):
+        p = self.project(ignore=".env\n")
+        self.assertEqual(self.save(p, "A_TOKEN", A_TOKEN=TOKEN)["files"], {"A_TOKEN": [".env"]})
+        q = self.project(git=False)
+        self.assertEqual(self.save(q, "A_TOKEN", A_TOKEN=TOKEN)["files"], {"A_TOKEN": [".env"]})
+
+    def test_refuses_before_the_page_opens(self):
+        loose = self.project()
+        loose.write(".env", "A_TOKEN=old\n")
+        nothing_ignored = self.project()
+        for p, message in ((loose, "does not ignore"), (nothing_ignored, "No git-ignored .env file")):
+            with self.subTest(message=message):
+                r = run_keydrop("--env-auto", "--dir", str(p.root), "--var", "A_TOKEN", "--bind", "localhost")
+                self.assertEqual((r.returncode, r.stdout), (1, ""))
+                self.assertIn(message, r.stderr)
+
+    def test_explicit_env_refuses_tracked_and_template_files(self):
+        p = self.project(ignore=".env.local\n")
+        p.write(".env", "PORT=3000\n", commit=True)
+        for name, message in ((".env", "tracked by git"), (".env.example", "template")):
+            with self.subTest(name=name):
+                r = run_keydrop("--env", str(p.root / name), "--var", "A_TOKEN", "--bind", "localhost")
+                self.assertEqual((r.returncode, r.stdout), (1, ""))
+                self.assertIn(message, r.stderr)
+
+
+class ExecSourcesTest(unittest.TestCase):
+    def test_later_files_win_and_mode_files_follow_framework_order(self):
+        p = Project(git=False)
+        self.addCleanup(p.close)
+        p.write(".env", "A=env\nB=env\nC=env\nD=env\nE=env\n")
+        p.write(".env.development", "B=dev\nC=dev\nD=dev\n")
+        p.write(".env.local", "C=local\nD=local\nE=\n")
+        p.write(".env.development.local", "D=devlocal\n")
+        show = ["--", "sh", "-c", 'printf "%s %s %s %s" "$A" "$B" "$C" "$D"']
+        # The form the SessionStart note suggests: no --dir, run from the project directory.
+        r = run_keydrop("exec", "--env-auto", "A", "B", *show[:3], 'printf "%s %s" "$A" "$B"', cwd=str(p.root))
+        self.assertEqual((r.returncode, r.stdout), (0, "env env"), r.stderr)
+        r = run_exec("--env-auto", "--dir", str(p.root), "--mode", "development", "A", "B", "C", "D", *show)
+        self.assertEqual((r.returncode, r.stdout), (0, "env dev local devlocal"))
+        r = run_exec("--env-auto", "--dir", str(p.root), "A", "B", "C", "D", *show)
+        self.assertEqual((r.returncode, r.stdout), (0, "env env local local"))
+        r = run_exec("--env", str(p.root / ".env.local"), "--env", str(p.root / ".env"), "C", "D", "--",
+                     "sh", "-c", 'printf "%s %s" "$C" "$D"')
+        self.assertEqual((r.returncode, r.stdout), (0, "env env"))
+        # An empty later definition overrides, as frameworks do, so E counts as missing.
+        r = run_exec("--env-auto", "--dir", str(p.root), "E", "--", "true")
+        self.assertEqual(r.returncode, 125)
+        r = run_exec("--env", str(p.root / ".env"), "--mode", "development", "A", "--", "true")
+        self.assertEqual(r.returncode, 125)
+
+
+class ContextTest(unittest.TestCase):
+    def test_lists_names_from_ignored_files_only(self):
+        p = Project(ignore=".env.local\n")
+        self.addCleanup(p.close)
+        p.write(".env", "PORT=3000\n", commit=True)
+        r = run_keydrop("context", str(p.root))
+        self.assertEqual((r.returncode, r.stdout), (0, ""))
+        p.write(".env.local", f"A_TOKEN={TOKEN}\nEMPTY=\n")
+        r = run_keydrop("context", str(p.root))
+        self.assertEqual(r.returncode, 0)
+        out = json.loads(r.stdout)["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "SessionStart")
+        self.assertIn(".env.local: A_TOKEN.", out["additionalContext"])
+        self.assertIn(f'exec --env-auto --dir "{p.root.resolve()}" NAME', out["additionalContext"])
+        for absent in (TOKEN, "PORT", "EMPTY"):
+            self.assertNotIn(absent, out["additionalContext"])
+
+    def test_uses_claude_project_dir_and_never_fails(self):
+        p = Project(git=False)
+        self.addCleanup(p.close)
+        p.write(".env", f"A_TOKEN={TOKEN}\n")
+        r = subprocess.run([sys.executable, "-I", str(SCRIPT), "context"], capture_output=True, text=True,
+                           env={**os.environ, "CLAUDE_PROJECT_DIR": str(p.root)})
+        self.assertIn("A_TOKEN", r.stdout)
+        r = run_keydrop("context", str(p.root / "missing"))
+        self.assertEqual((r.returncode, r.stdout), (0, ""))
+
+
 if __name__ == "__main__":
     unittest.main()

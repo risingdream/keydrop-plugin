@@ -45,7 +45,7 @@ Requirements: `python3` 3.9 or newer. Tailscale for the default network mode. ma
 Ask the agent for something that needs a key ("set up the OpenAI key for this project"). It runs:
 
 ```bash
-python3 -I keydrop.py --env ./.env --title myapp --var OPENAI_API_KEY:sk-
+python3 -I keydrop.py --env-auto --title myapp --var OPENAI_API_KEY:sk-
 ```
 
 and gives you a link like `http://100.x.y.z:54321/<random>`. Open it on a device on your tailnet,
@@ -61,7 +61,8 @@ You can also run the script yourself; `python3 keydrop.py --help` lists every op
 
 | Flag | Where the value goes |
 |---|---|
-| `--env PATH` | `NAME=value` in a `.env` file. Other lines are kept, the file is replaced atomically with mode 600, and keydrop warns when the file is not git-ignored. Free-text values are quoted so dotenv parsers read them back unchanged; a value that cannot be quoted safely is refused |
+| `--env-auto` | The project's `.env` files, chosen per variable (project directory: `--dir`, default current). A name already defined in a git-ignored `.env*` file is updated there, in every such file, so no stale copy shadows the new value. A new name goes to an existing ignored `.env.local` or `.env`, otherwise a new ignored `.env` (or `.env.local`). Tracked files and templates (`.env.example`, `.sample`, `.template`, `.tmpl`, `.dist`) are never written. If the only candidate is not git-ignored, keydrop stops before the page opens. The first output line lists the chosen files under `files` |
+| `--env PATH` | `NAME=value` in that file. Refuses git-tracked files and templates. Other lines are kept, the file is replaced atomically with mode 600, and keydrop warns when the file is not git-ignored. Free-text values are quoted so dotenv parsers read them back unchanged; a value that cannot be quoted safely is refused |
 | `--keychain SERVICE` | macOS Keychain generic password (service `SERVICE`, account `NAME`). The value is passed to `security` on stdin, hex-encoded, never as an argument |
 | `--sink-cmd "CMD"` | Runs `CMD` once per variable with the value on stdin. `{name}` is replaced with the variable name and `KEYDROP_NAME` is set. Output is discarded |
 
@@ -78,6 +79,7 @@ Commands that work with `--sink-cmd`:
 |---|---|---|
 | `--var NAME[:p1\|p2]` | required, repeatable | A field on the page, with optional accepted prefixes |
 | `--format token\|text` | `token` | `token`: 16–400 chars of `A-Z a-z 0-9 _ - .`; `text`: 1–2048 chars, no control characters |
+| `--dir DIR` | `.` | Project directory for `--env-auto` |
 | `--bind auto\|localhost\|IP` | `auto` | `auto` uses this machine's Tailscale IPv4. `0.0.0.0` and `::` are refused |
 | `--timeout SECONDS` | `600` | The page closes after this long with nothing saved |
 | `--port N` | random | Listening port |
@@ -93,20 +95,33 @@ start a fresh shell for every command. `exec` reads the named values and runs on
 added to its environment:
 
 ```bash
-python3 -I keydrop.py exec --keychain myapp OPENAI_API_KEY -- python3 app.py
-python3 -I keydrop.py exec --env ./.env A_TOKEN B_TOKEN -- \
+python3 -I keydrop.py exec --env-auto A_TOKEN B_TOKEN -- \
   sh -c 'curl -sf -H "Authorization: Bearer $A_TOKEN" https://api.example.com/health'
+python3 -I keydrop.py exec --keychain myapp OPENAI_API_KEY -- python3 app.py
 ```
 
 - Nothing is printed. keydrop replaces itself with the command, so the exit code is the command's own.
 - If any name is missing or empty it exits `125` and runs nothing (`127`: command not found,
   `126`: not executable). The error lists names only.
-- `--env` understands `KEY=value`, `export KEY=value`, single- and double-quoted values and
+- `--env-auto` reads `.env` then `.env.local` in `--dir` (default current directory); with
+  `--mode M` it reads `.env`, `.env.M`, `.env.local`, `.env.M.local`. Later files win, including an
+  empty definition, the same order Next.js and Vite use. `--env PATH` can be repeated; later wins.
+- `.env` parsing understands `KEY=value`, `export KEY=value`, single- and double-quoted values and
   trailing `# comments`; the last definition of a name wins. Escapes inside double quotes are not
   interpreted.
 - `--keychain` reads the item `keydrop` wrote (service `SERVICE`, account `NAME`), including
   non-ASCII values that `security find-generic-password -w` would print as hex.
 - Single-quote `$NAME` as above so the child shell expands it, not yours.
+
+### Session start note (Claude Code)
+
+The plugin ships a SessionStart hook that runs `keydrop.py context` in the project. When the
+project's git-ignored `.env*` files define secrets, it adds a short note to the session listing
+their **names** and the exact `exec --env-auto --dir <project>` command to use. Values never
+enter the prompt. Nothing is added when there are none. Keychain items are not listed.
+
+Codex plugins cannot ship hooks (`plugin_hooks` is marked removed in Codex 0.159), and OpenCode
+has no equivalent here, so on those agents the skill alone guides the agent.
 
 ## Security model
 
@@ -119,6 +134,8 @@ How:
   devices with WireGuard, so plain HTTP inside the tailnet is not readable on the wire.
 - The path contains 144 bits of randomness; every other path is a 404. The page closes after one
   successful save or on timeout, and a second submission is refused.
+- `.env` destinations refuse files that git tracks and committed templates, so a secret is not
+  committed by accident.
 - The value goes to the destination on stdin or straight into a mode-600 file. stdout carries only
   variable names.
 - Responses send `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, a strict
@@ -130,6 +147,10 @@ What it does not protect against:
 - Anyone on your tailnet who gets the URL before you use it. Do not paste the URL anywhere public.
 - An agent that reads the destination afterwards (`cat .env`). The skill tells the agent not to;
   keydrop cannot enforce it.
+- Another project's agent reading this project's secrets. Every agent runs as your OS user and can
+  read any `.env` file or Keychain item that user can. "Per project" in keydrop means where values
+  are stored and which names are suggested, not an access boundary; use an agent sandbox or a
+  secrets manager with per-project access (1Password, Doppler, Infisical) when you need one.
 - A compromised machine.
 
 The `100.64.0.0/10` range Tailscale uses is shared with carrier-grade NAT. If another interface on
@@ -146,7 +167,7 @@ claude plugin validate .
 
 `.claude-plugin/` and `.agents/plugins/` hold the Claude Code and Codex marketplaces; both point at
 `plugins/keydrop/`, whose `.claude-plugin/plugin.json` and `.codex-plugin/plugin.json` share one
-`skills/` folder. Keep the version the same in all four manifests, `SKILL.md` and `__version__` in `keydrop.py`.
+`skills/` folder. `plugins/keydrop/hooks/hooks.json` is the Claude Code SessionStart hook. Keep the version the same in all four manifests, `SKILL.md` and `__version__` in `keydrop.py`.
 
 ## License
 

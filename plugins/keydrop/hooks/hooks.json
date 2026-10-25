@@ -1,0 +1,16 @@
+{
+  "description": "Tell the agent which secrets this project has saved, by name only",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I \"${CLAUDE_PLUGIN_ROOT}/skills/keydrop/keydrop.py\" context",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
