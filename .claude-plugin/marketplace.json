@@ -1,0 +1,32 @@
+{
+  "name": "keydrop-plugin",
+  "owner": {
+    "name": "risingdream"
+  },
+  "metadata": {
+    "description": "keydrop — hand API keys and passwords to a coding agent through a one-time page instead of the chat",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "keydrop",
+      "source": "./plugins/keydrop",
+      "description": "Agent skill that opens a one-time secret input page on your Tailscale address (or localhost) so you can paste an API key from your phone or another device. The value goes straight to a .env file, the macOS Keychain or any command that reads stdin (gh secret set, secret-tool, …) and never enters the conversation. Python standard library only.",
+      "version": "0.1.0",
+      "author": {
+        "name": "risingdream"
+      },
+      "homepage": "https://github.com/risingdream/keydrop-plugin",
+      "license": "MIT",
+      "category": "security",
+      "keywords": [
+        "secrets",
+        "api-key",
+        "env",
+        "keychain",
+        "tailscale",
+        "skill"
+      ]
+    }
+  ]
+}
