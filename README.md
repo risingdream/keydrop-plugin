@@ -163,6 +163,7 @@ in that case.
 python3 -m unittest discover -s tests
 KEYDROP_TEST_KEYCHAIN=1 python3 -m unittest discover -s tests   # also writes and deletes one Keychain item
 claude plugin validate .
+python3 -I scripts/agent_smoke.py   # one real Claude Code run: session note, exec, no value in the transcript
 ```
 
 `.claude-plugin/` and `.agents/plugins/` hold the Claude Code and Codex marketplaces; both point at
