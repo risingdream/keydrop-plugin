@@ -84,10 +84,26 @@ class EnvSinkTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.env.stat().st_mode), 0o600)
         self.assertEqual([p.name for p in Path(self.dir.name).iterdir()], [".env"])
 
+    def test_rejection_says_why_without_echoing_the_value(self):
+        d = Drop("--env", str(self.env), "--var", "A_KEY:sk-", "--var", "B_TOKEN", "--var", "C_TOKEN", timeout=5)
+        with urllib.request.urlopen(d.url, timeout=10) as r:
+            self.assertIn("Starts with sk- · Letters, digits and _ - . · 16–400 characters", r.read().decode())
+        bad = {"A_KEY": "pk-" + "a" * 20, "B_TOKEN": "short", "C_TOKEN": "has space " + "a" * 16}
+        status, body = d.post(**bad)
+        self.assertEqual(status, 400)
+        self.assertIn("A_KEY: must start with sk-", body)
+        self.assertIn("B_TOKEN: must be 16–400 characters (this one is 5)", body)
+        self.assertIn("C_TOKEN: only letters, digits and _ - . are allowed", body)
+        for value in bad.values():
+            self.assertNotIn(value, body)
+        self.assertEqual(d.finish()[0], 2)
+        self.assertFalse(self.env.exists())
+
     def test_text_values_are_quoted_or_refused(self):
         d = Drop("--env", str(self.env), "--var", "DB_PASSWORD", "--format", "text")
-        status, _ = d.post(DB_PASSWORD="""a'b"c$d""")
+        status, body = d.post(DB_PASSWORD="""a'b"c$d""")
         self.assertEqual(status, 400)
+        self.assertIn("cannot be written to .env safely", body)
         status, _ = d.post(DB_PASSWORD="p@ss w#rd $x")
         self.assertEqual(status, 200)
         code, _, _ = d.finish()

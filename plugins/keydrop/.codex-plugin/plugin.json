@@ -1,6 +1,6 @@
 {
   "name": "keydrop",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Receive API keys, tokens and passwords without exposing them in the conversation. Opens a one-time input page on your Tailscale address (or localhost); the value is written to a .env file, the macOS Keychain, or piped to any command on stdin. `keydrop exec` then runs one command with the saved values in its environment.",
   "author": {
     "name": "risingdream"

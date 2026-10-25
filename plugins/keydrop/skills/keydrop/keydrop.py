@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_\-.]{16,400}")
 # No control characters: a newline would break .env files and shell injection of the value.
@@ -62,7 +62,15 @@ MESSAGES = {
     "en": {
         "suffix": "Secret drop",
         "intro": "Values are saved to {dest}. Fill only the fields you need. This page closes after saving.",
-        "bad": "Invalid format: {names}",
+        "bad": "Nothing was saved. Fix these fields:",
+        "prefix": "{name}: must start with {prefixes}",
+        "length": "{name}: must be {lo}–{hi} characters (this one is {n})",
+        "chars": "{name}: only letters, digits and _ - . are allowed",
+        "control": "{name}: line breaks and control characters are not allowed",
+        "unsafe": "{name}: a value with both ' and one of \" $ ` \\ cannot be written to .env safely",
+        "hint_token": "Letters, digits and _ - . · {lo}–{hi} characters",
+        "hint_text": "{lo}–{hi} characters, no line breaks",
+        "hint_prefix": "Starts with {prefixes} · ",
         "empty": "Fill at least one field.",
         "failed": "Could not save: {names}. Ask the agent for another way to deliver it.",
         "saved": "Saved: {names}. You can close this window.",
@@ -74,7 +82,15 @@ MESSAGES = {
     "ko": {
         "suffix": "키 입력",
         "intro": "{dest} 에 저장됩니다. 필요한 칸만 채우세요. 저장하면 이 페이지는 닫힙니다.",
-        "bad": "형식이 맞지 않습니다: {names}",
+        "bad": "저장하지 않았습니다. 아래 칸을 고쳐 주세요.",
+        "prefix": "{name}: {prefixes} 로 시작해야 합니다",
+        "length": "{name}: {lo}~{hi}자여야 합니다(지금 {n}자)",
+        "chars": "{name}: 영문·숫자·_ - . 만 쓸 수 있습니다",
+        "control": "{name}: 줄바꿈·제어 문자는 쓸 수 없습니다",
+        "unsafe": "{name}: ' 와 \" $ ` \\ 중 하나가 함께 든 값은 .env 에 안전하게 쓸 수 없습니다",
+        "hint_token": "영문·숫자·_ - . · {lo}~{hi}자",
+        "hint_text": "{lo}~{hi}자, 줄바꿈 없이",
+        "hint_prefix": "{prefixes} 로 시작 · ",
         "empty": "최소 한 칸은 채워야 합니다.",
         "failed": "저장하지 못했습니다: {names}. 에이전트에게 다른 전달 방법을 물어보세요.",
         "saved": "저장했습니다: {names}. 이 창을 닫으셔도 됩니다.",
@@ -372,7 +388,8 @@ body{{font:16px -apple-system,system-ui,sans-serif;color:var(--fg);background:va
 label{{display:block;margin:18px 0 6px;font:600 14px ui-monospace,monospace}}
 input{{width:100%;box-sizing:border-box;font:16px ui-monospace,monospace;padding:12px;border:1px solid var(--line);border-radius:8px;background:transparent;color:inherit}}
 button{{margin-top:20px;width:100%;padding:13px;font-size:16px;border:0;border-radius:8px;background:var(--accent);color:#fff}}
-p{{color:var(--muted)}}.err{{color:#dc2626}}</style></head><body>
+small{{display:block;margin-top:6px;font-size:13px;color:var(--muted)}}
+p{{color:var(--muted);white-space:pre-line}}.err{{color:#dc2626}}</style></head><body>
 <h2>{title}</h2><p class="{cls}">{msg}</p>{form}</body></html>"""
 
 
@@ -413,11 +430,29 @@ def main() -> None:
     state = {"code": None}
     lock = threading.Lock()
 
+    lo, hi = (16, 400) if args.format == "token" else (1, 2048)
+    base_hint = t["hint_token" if args.format == "token" else "hint_text"].format(lo=lo, hi=hi)
+
+    def check_value(name: str, v: str, prefixes: list[str]) -> str | None:
+        # The reason is shown to the person who typed the value; it never contains the value itself.
+        if prefixes and not any(v.startswith(p) for p in prefixes):
+            return t["prefix"].format(name=name, prefixes=t["or"].join(prefixes))
+        if not lo <= len(v) <= hi:
+            return t["length"].format(name=name, lo=lo, hi=hi, n=len(v))
+        if not value_re.fullmatch(v):
+            return t["chars" if args.format == "token" else "control"].format(name=name)
+        if sink.rejects(v):
+            return t["unsafe"].format(name=name)
+        return None
+
     def form_html() -> str:
         fields = "".join(
             f'<label for="{n}">{n}</label>'
             f'<input id="{n}" name="{n}" type="password" autocomplete="off" spellcheck="false" '
+            f'autocapitalize="off" autocorrect="off" aria-describedby="{n}-hint" '
             f'placeholder="{html.escape(t["or"].join(p) + "…" if p else t["value"])}">'
+            f'<small id="{n}-hint">'
+            f'{html.escape((t["hint_prefix"].format(prefixes=t["or"].join(p)) if p else "") + base_hint)}</small>'
             for n, p in specs.items()
         )
         return (f'<form method="post" action="{route}" autocomplete="off">{fields}'
@@ -462,13 +497,13 @@ def main() -> None:
                 v = (form.get(name) or [""])[0].strip()
                 if not v:
                     continue
-                if ((prefixes and not any(v.startswith(p) for p in prefixes))
-                        or not value_re.fullmatch(v) or sink.rejects(v)):
-                    errors.append(name)
+                problem = check_value(name, v, prefixes)
+                if problem:
+                    errors.append(problem)
                 else:
                     values[name] = v
             if errors:
-                return self._page(400, t["bad"].format(names=", ".join(errors)), True, err=True)
+                return self._page(400, "\n".join([t["bad"], *errors]), True, err=True)
             if not values:
                 return self._page(400, t["empty"], True, err=True)
             # One save per page: a second submission racing the shutdown must not write again.

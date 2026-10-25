@@ -4,7 +4,7 @@ description: Receive an API key, token or password from the user without it ever
 license: MIT
 compatibility: Requires python3 (3.9+, standard library only). The default network mode needs an active Tailscale connection; --bind localhost works without it when the browser runs on the same machine. --keychain needs macOS. Works with Claude Code, Codex, OpenCode and other agents that run shell commands.
 metadata:
-  version: 0.2.0
+  version: 0.2.1
 ---
 
 # keydrop
