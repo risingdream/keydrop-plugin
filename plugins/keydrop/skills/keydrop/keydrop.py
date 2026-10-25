@@ -23,6 +23,12 @@ stdout (one JSON object per line):
   {"event":"error","failed":[...],"vars":[...]} exit 3 (the sink rejected one or more values)
 Startup problems print a message to stderr and exit 1 before the page opens, so a value the
 user typed is never lost to a misconfigured sink.
+
+Using a saved secret (one command only, nothing printed):
+  python3 -I keydrop.py exec (--env PATH | --keychain SERVICE) NAME [NAME ...] -- CMD [ARG ...]
+The named values are added to CMD's environment and keydrop is replaced by CMD, so the exit
+code is CMD's own. keydrop's own failures exit 125 (missing name, unreadable source),
+126 (CMD not executable) or 127 (CMD not found) without running anything.
 """
 
 from __future__ import annotations
@@ -44,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_\-.]{16,400}")
 # No control characters: a newline would break .env files and shell injection of the value.
@@ -187,15 +193,20 @@ class EnvSink:
         return []
 
 
+def keychain_cli(service: str) -> str:
+    if sys.platform != "darwin":
+        sys.exit("--keychain needs macOS. On Linux use --sink-cmd with secret-tool (see README).")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", service):
+        sys.exit(f"Invalid keychain service name: {service!r} (letters, digits, . _ - only)")
+    cli = shutil.which("security") or "/usr/bin/security"
+    if not os.access(cli, os.X_OK):
+        sys.exit("macOS `security` command not found")
+    return cli
+
+
 class KeychainSink:
     def __init__(self, service: str):
-        if sys.platform != "darwin":
-            sys.exit("--keychain needs macOS. On Linux use --sink-cmd with secret-tool (see README).")
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", service):
-            sys.exit(f"Invalid keychain service name: {service!r} (letters, digits, . _ - only)")
-        self.cli = shutil.which("security") or "/usr/bin/security"
-        if not os.access(self.cli, os.X_OK):
-            sys.exit("macOS `security` command not found")
+        self.cli = keychain_cli(service)
         self.service = service
         self.label = f"macOS Keychain ({service})"
 
@@ -259,7 +270,99 @@ def parse_var(spec: str) -> tuple[str, list[str]]:
     return name, [p for p in prefixes.split("|") if p]
 
 
-PAGE = """<!doctype html><html lang="{lang}"><head><meta charset="utf-8">
+def read_env_file(path: Path) -> dict[str, str]:
+    # The inverse of env_literal, plus the unquoted `KEY=value # comment` form other tools write.
+    # Later definitions win, as when a shell sources the file.
+    values = {}
+    for line in path.read_text().splitlines():
+        m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+        if not m:
+            continue
+        raw = m.group(2).strip()
+        quoted = re.fullmatch(r"""(['"])(.*)\1(?:\s+#.*)?""", raw)
+        values[m.group(1)] = quoted.group(2) if quoted else re.split(r"\s+#", raw, maxsplit=1)[0]
+    return values
+
+
+def read_keychain(cli: str, service: str, name: str) -> str | None:
+    # `-w` prints non-ASCII passwords as bare hex, indistinguishable from a hex token, so read the
+    # `-g` line instead: `password: "value"` or `password: 0xHEX  "escaped"`. It goes to stderr.
+    try:
+        out = run([cli, "find-generic-password", "-s", service, "-a", name, "-g"], 30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    for line in out.stderr.splitlines():
+        if line.startswith("password: 0x"):
+            return bytes.fromhex(line[len("password: 0x"):].split()[0]).decode(errors="replace")
+        if line.startswith('password: "') and line.endswith('"'):
+            return line[len('password: "'):-1]
+    return None
+
+
+class ExecParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        exec_fail(message)
+
+
+def exec_fail(message: str, code: int = 125):
+    print(f"keydrop exec: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def exec_main(argv: list[str]) -> None:
+    split = argv.index("--") if "--" in argv else len(argv)
+    command = argv[split + 1:]
+    ap = ExecParser(prog="keydrop.py exec",
+                    description="Run one command with saved secrets added to its environment.")
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("--env", metavar="PATH", help=".env file to read")
+    source.add_argument("--keychain", metavar="SERVICE", help="macOS Keychain service name")
+    ap.add_argument("names", nargs="+", metavar="NAME")
+    args = ap.parse_args(argv[:split])
+    if split == len(argv):
+        exec_fail("missing `--` before the command")
+    if not command:
+        exec_fail("no command after `--`")
+    for name in args.names:
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
+            exec_fail(f"invalid variable name: {name!r}")
+
+    try:
+        if args.env:
+            path = Path(args.env).expanduser()
+            try:
+                found = read_env_file(path)
+            except OSError as exc:
+                exec_fail(f"cannot read {path}: {exc.strerror}")
+            values = {n: found[n] for n in args.names if found.get(n)}
+            label = str(path)
+        else:
+            cli = keychain_cli(args.keychain)
+            values = {}
+            for n in args.names:
+                v = read_keychain(cli, args.keychain, n)
+                if v:
+                    values[n] = v
+            label = f"Keychain service {args.keychain}"
+    except SystemExit as exc:
+        if isinstance(exc.code, str):
+            exec_fail(exc.code)
+        raise
+    missing = [n for n in args.names if n not in values]
+    if missing:
+        exec_fail(f"not found in {label}: {', '.join(missing)}")
+    try:
+        os.execvpe(command[0], command, {**os.environ, **values})
+    except FileNotFoundError:
+        exec_fail(f"command not found: {command[0]}", 127)
+    except PermissionError:
+        exec_fail(f"command not executable: {command[0]}", 126)
+
+
+PAGE ="""<!doctype html><html lang="{lang}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} · {suffix}</title>
 <style>
@@ -274,7 +377,10 @@ p{{color:var(--muted)}}.err{{color:#dc2626}}</style></head><body>
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="One-time page for handing a secret to an agent.")
+    if sys.argv[1:2] == ["exec"]:
+        return exec_main(sys.argv[2:])
+    ap = argparse.ArgumentParser(description="One-time page for handing a secret to an agent.",
+                                 epilog="To run a command with saved secrets: keydrop.py exec --help")
     sink_group = ap.add_mutually_exclusive_group(required=True)
     sink_group.add_argument("--env", metavar="PATH", help=".env file to write")
     sink_group.add_argument("--keychain", metavar="SERVICE", help="macOS Keychain service name")

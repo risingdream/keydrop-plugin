@@ -2,16 +2,16 @@
 name: keydrop
 description: Receive an API key, token or password from the user without it ever appearing in the conversation. Opens a one-time input page on the machine's Tailscale address (or localhost) that the user fills in from a phone or another device; the value goes straight to a .env file, the macOS Keychain, or a command that reads stdin (gh secret set, secret-tool, …). Use whenever the task needs a secret — "add my API key", "set the token", "put the key in .env", "register a secret", 키 등록, API 키 넣어줘, 시크릿 입력, 토큰 전달 — and especially when the user cannot type into a terminal (remote or mobile session). Never ask the user to paste a secret into the chat.
 license: MIT
-compatibility: Requires python3 (3.9+, standard library only). The default network mode needs an active Tailscale connection; --bind localhost works without it when the browser runs on the same machine. --keychain needs macOS. Works with Claude Code, Codex, Cursor and other agents that run shell commands.
+compatibility: Requires python3 (3.9+, standard library only). The default network mode needs an active Tailscale connection; --bind localhost works without it when the browser runs on the same machine. --keychain needs macOS. Works with Claude Code, Codex, OpenCode and other agents that run shell commands.
 metadata:
-  version: 0.1.0
+  version: 0.2.0
 ---
 
 # keydrop
 
 Never ask for a secret in the chat. Start keydrop, give the user its one-time URL, and wait for it to report which variable names were saved. You never see the value.
 
-The script is `keydrop.py` in this skill's folder. In Claude Code it is `${CLAUDE_PLUGIN_ROOT}/skills/keydrop/keydrop.py`; other agents use the path of the folder this SKILL.md was loaded from.
+The script is `keydrop.py` in the same folder as this SKILL.md. Claude Code expands `${CLAUDE_PLUGIN_ROOT}/skills/keydrop/keydrop.py` in the commands below to that path. In Codex, OpenCode and other agents, replace it with the folder of the SKILL.md path your skill list shows, plus `/keydrop.py`.
 
 ## Pick a destination
 
@@ -50,11 +50,17 @@ Only use a command that reads the value from stdin. Never build a command that p
 5. Confirm by name only, never by value:
    - `.env`: `grep -cE '^NAME=.+' .env`
    - Keychain: `security find-generic-password -s <service> -a NAME >/dev/null && echo present`
-6. To use a Keychain secret in a command without printing it, expand it inside the child shell:
+6. Use it now. Saving does not change the environment of your own process or of later shell calls, so wrap each command that needs the secret in `exec`. It reads the named values from the `.env` or the Keychain, adds them to that one command's environment and prints nothing; the exit code is the command's own.
 
    ```bash
-   sh -c 'OPENAI_API_KEY="$(security find-generic-password -s myapp -a OPENAI_API_KEY -w)" python3 app.py'
+   python3 -I "${CLAUDE_PLUGIN_ROOT}/skills/keydrop/keydrop.py" exec --keychain myapp OPENAI_API_KEY -- python3 app.py
+   python3 -I "${CLAUDE_PLUGIN_ROOT}/skills/keydrop/keydrop.py" exec --env ./.env A_TOKEN B_TOKEN -- \
+     sh -c 'curl -sf -H "Authorization: Bearer $A_TOKEN" https://api.example.com/health'
    ```
+
+   - Put `$NAME` inside single quotes so the child shell expands it. Expanded by your outer shell it is empty.
+   - A missing or empty name fails with exit 125 and runs nothing; 127 means the command was not found.
+   - Apps that load `.env` themselves need no wrapper; restart them if they are already running.
 
 ## Startup failures
 
@@ -71,7 +77,7 @@ Fallback when keydrop cannot be used: ask the user to run the destination's own 
 
 ## Never
 
-- Print, log, commit or pass a secret as a command argument. Do not `cat` the `.env`, `echo "$NAME"`, run `env`, or use `security ... -w` outside a child-shell expansion.
+- Print, log, commit or pass a secret as a command argument. Do not `cat` the `.env`, `echo "$NAME"`, run `env` or `exec ... -- env`, or read values with `security ... -w`. To check that a value is set, use the exit code: `exec ... NAME -- sh -c '[ -n "$NAME" ]'`.
 - Open the page to every interface (`--bind 0.0.0.0` is refused on purpose).
 - Reuse a URL. Start a new keydrop instead.
 - Kill other processes by pattern (`pkill -f`). If one is left running, stop only the PID you started.

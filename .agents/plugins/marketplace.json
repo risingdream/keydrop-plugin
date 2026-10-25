@@ -1,0 +1,21 @@
+{
+  "name": "keydrop-plugin",
+  "interface": {
+    "displayName": "keydrop-plugin"
+  },
+  "plugins": [
+    {
+      "name": "keydrop",
+      "source": {
+        "source": "local",
+        "path": "./plugins/keydrop"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Security",
+      "version": "0.2.0"
+    }
+  ]
+}

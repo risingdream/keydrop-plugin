@@ -10,8 +10,10 @@ key, and it goes straight to a `.env` file, the macOS Keychain, or any command t
 The agent only learns which variable names were saved, so the value never appears in the
 transcript, the logs or a command line.
 
-It is an [Agent Skill](https://agentskills.io) packaged as a Claude Code plugin: one `SKILL.md`
-and one Python script that uses only the standard library.
+It is an [Agent Skill](https://agentskills.io) packaged as a Claude Code and Codex plugin: one
+`SKILL.md` and one Python script that uses only the standard library. `keydrop exec` then runs a
+single command with the saved values in its environment, so the agent can use a key in the same
+session without ever printing it.
 
 ## Install
 
@@ -19,7 +21,22 @@ and one Python script that uses only the standard library.
 |---|---|
 | Claude Code | `claude plugin marketplace add risingdream/keydrop-plugin`, then `claude plugin install keydrop@keydrop-plugin` |
 | Claude Desktop (Code) | Settings → Plugins → Add → From repository → `risingdream/keydrop-plugin` |
-| Codex, Cursor, other agents | Copy `plugins/keydrop/skills/keydrop/` into the agent's skills folder (for example `~/.codex/skills/keydrop/`) |
+| Codex | `codex plugin marketplace add risingdream/keydrop-plugin`, then `codex plugin add keydrop@keydrop-plugin` |
+| OpenCode | Copy the skill folder (below) |
+| Other agents | Copy `plugins/keydrop/skills/keydrop/` into the agent's skills folder |
+
+OpenCode reads skills from `~/.config/opencode/skills/` (every project) or `.opencode/skills/`
+(one project):
+
+```bash
+git clone https://github.com/risingdream/keydrop-plugin /tmp/keydrop-plugin
+mkdir -p ~/.config/opencode/skills
+cp -R /tmp/keydrop-plugin/plugins/keydrop/skills/keydrop ~/.config/opencode/skills/
+opencode debug skill | grep -A2 '"name": "keydrop"'
+```
+
+Pull the repository and copy again to update. If another skill named `keydrop` is already
+installed, keep only one: agents pick one by name and may not pick this one.
 
 Requirements: `python3` 3.9 or newer. Tailscale for the default network mode. macOS for `--keychain`.
 
@@ -69,6 +86,28 @@ Commands that work with `--sink-cmd`:
 
 Exit codes: `0` saved, `1` startup error (nothing opened), `2` timeout, `3` the destination refused a value.
 
+### Using a saved secret: `keydrop exec`
+
+Saving a secret cannot change the environment of an agent that is already running, and most agents
+start a fresh shell for every command. `exec` reads the named values and runs one command with them
+added to its environment:
+
+```bash
+python3 -I keydrop.py exec --keychain myapp OPENAI_API_KEY -- python3 app.py
+python3 -I keydrop.py exec --env ./.env A_TOKEN B_TOKEN -- \
+  sh -c 'curl -sf -H "Authorization: Bearer $A_TOKEN" https://api.example.com/health'
+```
+
+- Nothing is printed. keydrop replaces itself with the command, so the exit code is the command's own.
+- If any name is missing or empty it exits `125` and runs nothing (`127`: command not found,
+  `126`: not executable). The error lists names only.
+- `--env` understands `KEY=value`, `export KEY=value`, single- and double-quoted values and
+  trailing `# comments`; the last definition of a name wins. Escapes inside double quotes are not
+  interpreted.
+- `--keychain` reads the item `keydrop` wrote (service `SERVICE`, account `NAME`), including
+  non-ASCII values that `security find-generic-password -w` would print as hex.
+- Single-quote `$NAME` as above so the child shell expands it, not yours.
+
 ## Security model
 
 What keydrop protects against: a secret ending up in the agent's context, chat history, provider
@@ -104,6 +143,10 @@ python3 -m unittest discover -s tests
 KEYDROP_TEST_KEYCHAIN=1 python3 -m unittest discover -s tests   # also writes and deletes one Keychain item
 claude plugin validate .
 ```
+
+`.claude-plugin/` and `.agents/plugins/` hold the Claude Code and Codex marketplaces; both point at
+`plugins/keydrop/`, whose `.claude-plugin/plugin.json` and `.codex-plugin/plugin.json` share one
+`skills/` folder. Keep the version the same in all four manifests, `SKILL.md` and `__version__` in `keydrop.py`.
 
 ## License
 

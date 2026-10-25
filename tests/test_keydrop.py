@@ -161,14 +161,79 @@ class KeychainSinkTest(unittest.TestCase):
                        capture_output=True)
 
     def test_roundtrip(self):
-        value = "p@ss w'rd \"x\" $y"
-        d = Drop("--keychain", self.SERVICE, "--var", "A_PASSWORD", "--format", "text")
-        self.assertEqual(d.post(A_PASSWORD=value)[0], 200)
-        code, _, _ = d.finish()
-        self.assertEqual(code, 0)
-        got = subprocess.run(["security", "find-generic-password", "-s", self.SERVICE, "-a", "A_PASSWORD", "-w"],
-                             capture_output=True, text=True)
-        self.assertEqual(got.stdout.rstrip("\n"), value)
+        # Non-ASCII matters: `security -w` would hand it back as hex.
+        for value in ("p@ss w'rd \"x\" $y", "비밀번호 pw"):
+            with self.subTest(value=value):
+                d = Drop("--keychain", self.SERVICE, "--var", "A_PASSWORD", "--format", "text")
+                self.assertEqual(d.post(A_PASSWORD=value)[0], 200)
+                code, _, _ = d.finish()
+                self.assertEqual(code, 0)
+                r = run_exec("--keychain", self.SERVICE, "A_PASSWORD", "--", "sh", "-c", 'printf %s "$A_PASSWORD"')
+                self.assertEqual((r.returncode, r.stdout), (0, value))
+
+
+def run_exec(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, "-I", str(SCRIPT), "exec", *args],
+                          capture_output=True, text=True, timeout=30)
+
+
+class ExecTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.env = Path(self.dir.name) / ".env"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_reads_common_env_forms(self):
+        self.env.write_text(
+            "A=old\n"
+            "export B='p@ss w#rd $x'\n"
+            'C="x y" # note\n'
+            "D=plain # note\n"
+            "A=new\n"
+        )
+        r = run_exec("--env", str(self.env), "A", "B", "C", "D", "--",
+                     "sh", "-c", 'printf "%s|%s|%s|%s" "$A" "$B" "$C" "$D"')
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "new|p@ss w#rd $x|x y|plain", ""))
+
+    def test_reads_back_what_the_page_wrote(self):
+        values = {"A_PASSWORD": "p@ss w#rd $x", "B_PASSWORD": "it's fine", "C_PASSWORD": "비밀 번호"}
+        d = Drop("--env", str(self.env), "--format", "text", *[f"--var={n}" for n in values])
+        self.assertEqual(d.post(**values)[0], 200)
+        self.assertEqual(d.finish()[0], 0)
+        r = run_exec("--env", str(self.env), *values, "--",
+                     "sh", "-c", 'printf "%s|%s|%s" "$A_PASSWORD" "$B_PASSWORD" "$C_PASSWORD"')
+        self.assertEqual((r.returncode, r.stdout), (0, "|".join(values.values())))
+
+    def test_passes_child_exit_code_through(self):
+        self.env.write_text(f"A_TOKEN={TOKEN}\n")
+        r = run_exec("--env", str(self.env), "A_TOKEN", "--", "sh", "-c", "exit 7")
+        self.assertEqual(r.returncode, 7)
+
+    def test_missing_name_runs_nothing(self):
+        self.env.write_text(f"A_TOKEN={TOKEN}\nEMPTY=\n")
+        marker = Path(self.dir.name) / "ran"
+        r = run_exec("--env", str(self.env), "A_TOKEN", "B_TOKEN", "EMPTY", "--", "touch", str(marker))
+        self.assertEqual(r.returncode, 125)
+        self.assertIn("B_TOKEN, EMPTY", r.stderr)
+        self.assertNotIn(TOKEN, r.stdout + r.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_usage_errors(self):
+        self.env.write_text(f"A_TOKEN={TOKEN}\n")
+        cases = [
+            (("--env", str(self.env), "A_TOKEN", "true"), 125),            # no `--`
+            (("--env", str(self.env), "A_TOKEN", "--"), 125),              # no command
+            (("A_TOKEN", "--", "true"), 125),                              # no source
+            (("--env", str(self.env) + ".nope", "A_TOKEN", "--", "true"), 125),
+            (("--env", str(self.env), "A_TOKEN", "--", "no-such-program-keydrop"), 127),
+        ]
+        for args, code in cases:
+            with self.subTest(args=args):
+                r = run_exec(*args)
+                self.assertEqual(r.returncode, code, r.stderr)
+                self.assertNotIn(TOKEN, r.stdout + r.stderr)
 
 
 if __name__ == "__main__":
