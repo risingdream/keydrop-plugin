@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -170,6 +171,23 @@ class KeychainSinkTest(unittest.TestCase):
                 self.assertEqual(code, 0)
                 r = run_exec("--keychain", self.SERVICE, "A_PASSWORD", "--", "sh", "-c", 'printf %s "$A_PASSWORD"')
                 self.assertEqual((r.returncode, r.stdout), (0, value))
+
+
+class VersionTest(unittest.TestCase):
+    def test_every_manifest_has_the_same_version(self):
+        root = SCRIPT.parents[4]
+        plugin = root / "plugins" / "keydrop"
+        load = lambda p: json.loads((root / p).read_text())
+        found = {
+            ".claude-plugin/marketplace.json metadata": load(".claude-plugin/marketplace.json")["metadata"]["version"],
+            ".claude-plugin/marketplace.json plugin": load(".claude-plugin/marketplace.json")["plugins"][0]["version"],
+            ".agents/plugins/marketplace.json": load(".agents/plugins/marketplace.json")["plugins"][0]["version"],
+            ".claude-plugin/plugin.json": json.loads((plugin / ".claude-plugin" / "plugin.json").read_text())["version"],
+            ".codex-plugin/plugin.json": json.loads((plugin / ".codex-plugin" / "plugin.json").read_text())["version"],
+            "SKILL.md": re.search(r"^  version: (\S+)$", (SCRIPT.parent / "SKILL.md").read_text(), re.M).group(1),
+            "keydrop.py": re.search(r'^__version__ = "([^"]+)"$', SCRIPT.read_text(), re.M).group(1),
+        }
+        self.assertEqual(len(set(found.values())), 1, found)
 
 
 def run_exec(*args: str) -> subprocess.CompletedProcess:
